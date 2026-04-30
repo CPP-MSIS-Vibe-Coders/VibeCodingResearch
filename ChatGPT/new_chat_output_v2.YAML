@@ -1,0 +1,519 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Secure serverless Notes API with API Gateway, Lambda, and DynamoDB
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: notes-api
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    Description: Project name prefix for resource names
+
+  StageName:
+    Type: String
+    Default: prod
+    AllowedPattern: '^[a-zA-Z0-9_-]+$'
+    Description: API Gateway stage name
+
+  LambdaRuntime:
+    Type: String
+    Default: python3.12
+    AllowedValues:
+      - python3.12
+      - nodejs20.x
+    Description: Lambda runtime
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    MinValue: 128
+    MaxValue: 10240
+
+  LambdaTimeout:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 30
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues:
+      - 7
+      - 14
+      - 30
+      - 60
+      - 90
+      - 120
+      - 150
+      - 180
+      - 365
+      - 400
+      - 545
+      - 731
+      - 1096
+      - 1827
+      - 2192
+      - 2557
+      - 2922
+      - 3288
+      - 3653
+
+  ApiBurstLimit:
+    Type: Number
+    Default: 100
+
+  ApiRateLimit:
+    Type: Number
+    Default: 50
+
+Resources:
+  NotesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-notes'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: noteId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: noteId
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      DeletionProtectionEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: LambdaAssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-lambda-logs-dynamodb-xray'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteLambdaLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub '${NotesFunctionLogGroup.Arn}:*'
+
+              - Sid: DynamoDBNotesAccess
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                Resource: !GetAtt NotesTable.Arn
+
+              - Sid: XRayWrite
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  NotesFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-notes-handler'
+      RetentionInDays: !Ref LogRetentionDays
+
+  NotesFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-notes-handler'
+      Runtime: !Ref LambdaRuntime
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref NotesTable
+          POWERTOOLS_SERVICE_NAME: !Ref ProjectName
+          LOG_LEVEL: INFO
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import uuid
+          import boto3
+          from datetime import datetime, timezone
+          from botocore.exceptions import ClientError
+
+          dynamodb = boto3.resource("dynamodb")
+          table = dynamodb.Table(os.environ["TABLE_NAME"])
+
+          def response(status, body):
+              return {
+                  "statusCode": status,
+                  "headers": {
+                      "Content-Type": "application/json",
+                      "X-Content-Type-Options": "nosniff",
+                      "Cache-Control": "no-store"
+                  },
+                  "body": json.dumps(body)
+              }
+
+          def parse_body(event):
+              try:
+                  return json.loads(event.get("body") or "{}")
+              except json.JSONDecodeError:
+                  return None
+
+          def handler(event, context):
+              method = event.get("httpMethod")
+              path_params = event.get("pathParameters") or {}
+              note_id = path_params.get("id")
+
+              if method == "POST":
+                  body = parse_body(event)
+                  if body is None:
+                      return response(400, {"message": "Invalid JSON"})
+                  content = body.get("content")
+                  if not isinstance(content, str) or not content.strip() or len(content) > 5000:
+                      return response(400, {"message": "content must be a non-empty string up to 5000 chars"})
+                  now = datetime.now(timezone.utc).isoformat()
+                  item = {
+                      "noteId": str(uuid.uuid4()),
+                      "content": content.strip(),
+                      "createdAt": now,
+                      "updatedAt": now
+                  }
+                  table.put_item(Item=item)
+                  return response(201, item)
+
+              if method == "GET" and note_id:
+                  result = table.get_item(Key={"noteId": note_id}, ConsistentRead=True)
+                  item = result.get("Item")
+                  if not item:
+                      return response(404, {"message": "Note not found"})
+                  return response(200, item)
+
+              if method == "PUT" and note_id:
+                  body = parse_body(event)
+                  if body is None:
+                      return response(400, {"message": "Invalid JSON"})
+                  content = body.get("content")
+                  if not isinstance(content, str) or not content.strip() or len(content) > 5000:
+                      return response(400, {"message": "content must be a non-empty string up to 5000 chars"})
+                  now = datetime.now(timezone.utc).isoformat()
+                  try:
+                      result = table.update_item(
+                          Key={"noteId": note_id},
+                          UpdateExpression="SET content = :c, updatedAt = :u",
+                          ConditionExpression="attribute_exists(noteId)",
+                          ExpressionAttributeValues={
+                              ":c": content.strip(),
+                              ":u": now
+                          },
+                          ReturnValues="ALL_NEW"
+                      )
+                      return response(200, result["Attributes"])
+                  except ClientError as e:
+                      if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                          return response(404, {"message": "Note not found"})
+                      raise
+
+              if method == "DELETE" and note_id:
+                  try:
+                      table.delete_item(
+                          Key={"noteId": note_id},
+                          ConditionExpression="attribute_exists(noteId)"
+                      )
+                      return response(204, {})
+                  except ClientError as e:
+                      if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                          return response(404, {"message": "Note not found"})
+                      raise
+
+              return response(405, {"message": "Method not allowed"})
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  ApiGatewayCloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-apigw-cw-role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ApiGatewayAssumeRole
+            Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+      Path: /
+
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${ProjectName}-${StageName}-access'
+      RetentionInDays: !Ref LogRetentionDays
+
+  NotesApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-api'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      DisableExecuteApiEndpoint: false
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  NotesResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref NotesApi
+      ParentId: !GetAtt NotesApi.RootResourceId
+      PathPart: notes
+
+  NoteByIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref NotesApi
+      ParentId: !Ref NotesResource
+      PathPart: '{id}'
+
+  PostNotesMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref NotesApi
+      ResourceId: !Ref NotesResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: false
+      RequestValidatorId: !Ref BodyOnlyValidator
+      RequestModels:
+        application/json: !Ref NoteRequestModel
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub >
+          arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${NotesFunction.Arn}/invocations
+      MethodResponses:
+        - StatusCode: 201
+
+  GetNoteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref NotesApi
+      ResourceId: !Ref NoteByIdResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      ApiKeyRequired: false
+      RequestParameters:
+        method.request.path.id: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub >
+          arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${NotesFunction.Arn}/invocations
+      MethodResponses:
+        - StatusCode: 200
+
+  PutNoteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref NotesApi
+      ResourceId: !Ref NoteByIdResource
+      HttpMethod: PUT
+      AuthorizationType: NONE
+      ApiKeyRequired: false
+      RequestParameters:
+        method.request.path.id: true
+      RequestValidatorId: !Ref BodyOnlyValidator
+      RequestModels:
+        application/json: !Ref NoteRequestModel
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub >
+          arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${NotesFunction.Arn}/invocations
+      MethodResponses:
+        - StatusCode: 200
+
+  DeleteNoteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref NotesApi
+      ResourceId: !Ref NoteByIdResource
+      HttpMethod: DELETE
+      AuthorizationType: NONE
+      ApiKeyRequired: false
+      RequestParameters:
+        method.request.path.id: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub >
+          arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${NotesFunction.Arn}/invocations
+      MethodResponses:
+        - StatusCode: 204
+
+  OptionsNotesMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref NotesApi
+      ResourceId: !Ref NotesResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  OptionsNoteByIdMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref NotesApi
+      ResourceId: !Ref NoteByIdResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,GET,PUT,DELETE'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  NoteRequestModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref NotesApi
+      ContentType: application/json
+      Name: NoteRequestModel
+      Schema:
+        "$schema": "http://json-schema.org/draft-04/schema#"
+        title: NoteRequest
+        type: object
+        additionalProperties: false
+        required:
+          - content
+        properties:
+          content:
+            type: string
+            minLength: 1
+            maxLength: 5000
+
+  BodyOnlyValidator:
+    Type: AWS::ApiGateway::RequestValidator
+    Properties:
+      RestApiId: !Ref NotesApi
+      Name: BodyOnlyValidator
+      ValidateRequestBody: true
+      ValidateRequestParameters: false
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - PostNotesMethod
+      - GetNoteMethod
+      - PutNoteMethod
+      - DeleteNoteMethod
+      - OptionsNotesMethod
+      - OptionsNoteByIdMethod
+    Properties:
+      RestApiId: !Ref NotesApi
+      Description: Initial deployment
+
+  ApiStage:
+    DependsOn:
+      - ApiGatewayAccount
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      StageName: !Ref StageName
+      RestApiId: !Ref NotesApi
+      DeploymentId: !Ref ApiDeployment
+      TracingEnabled: true
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          MetricsEnabled: true
+          DataTraceEnabled: false
+          LoggingLevel: INFO
+          ThrottlingBurstLimit: !Ref ApiBurstLimit
+          ThrottlingRateLimit: !Ref ApiRateLimit
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","ip":"$context.identity.sourceIp","requestTime":"$context.requestTime",
+          "httpMethod":"$context.httpMethod","routeKey":"$context.resourcePath","status":"$context.status",
+          "protocol":"$context.protocol","responseLength":"$context.responseLength","integrationError":"$context.integrationErrorMessage"}
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  LambdaInvokePermissionForApi:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NotesFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${NotesApi}/*/*/*'
+
+Outputs:
+  ApiBaseUrl:
+    Description: Base URL of the deployed API
+    Value: !Sub 'https://${NotesApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}'
+
+  NotesTableName:
+    Description: DynamoDB table name
+    Value: !Ref NotesTable
