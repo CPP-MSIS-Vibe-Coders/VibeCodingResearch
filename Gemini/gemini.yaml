@@ -1,0 +1,117 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Secure Serverless Notes API. 
+  Includes least privilege IAM roles, DynamoDB encryption at rest, PITR backups, X-Ray tracing, and strict concurrency limits for new accounts.
+
+Globals:
+  Function:
+    Timeout: 10
+    MemorySize: 256
+    Runtime: nodejs20.x
+    Architectures:
+      - arm64
+    Tracing: Active
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref NotesTable
+  Api:
+    TracingEnabled: true
+
+Resources:
+  # ==========================================
+  # DynamoDB Table
+  # ==========================================
+  NotesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "NotesTable-${AWS::StackName}"
+      AttributeDefinitions:
+        - AttributeName: NoteId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: NoteId
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # ==========================================
+  # IAM Role (Strict Least Privilege)
+  # ==========================================
+  NotesFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: DynamoDBTableAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Scan
+                Resource: !GetAtt NotesTable.Arn
+
+  # ==========================================
+  # Lambda Function & API Gateway Routes
+  # ==========================================
+  NotesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: app.handler
+      Role: !GetAtt NotesFunctionRole.Arn
+      
+      # NEW: Explicitly limit concurrent executions to fit within new account quotas
+      ReservedConcurrentExecutions: 10 
+      
+      Events:
+        CreateNote:
+          Type: Api
+          Properties:
+            Path: /notes
+            Method: post
+        GetNotes:
+          Type: Api
+          Properties:
+            Path: /notes
+            Method: get
+        GetNoteById:
+          Type: Api
+          Properties:
+            Path: /notes/{id}
+            Method: get
+        UpdateNote:
+          Type: Api
+          Properties:
+            Path: /notes/{id}
+            Method: put
+        DeleteNote:
+          Type: Api
+          Properties:
+            Path: /notes/{id}
+            Method: delete
+
+Outputs:
+  ApiGatewayEndpoint:
+    Description: "API Gateway endpoint URL for the Prod stage"
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/notes"
+  DynamoDBTableName:
+    Description: "Name of the secure DynamoDB table"
+    Value: !Ref NotesTable
